@@ -5,7 +5,7 @@
   "private": false,
   "type": "module",
   "license": "MIT",
-  "author": "bufan528",
+  "author": "GF6364",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
@@ -17,7 +17,7 @@
   "icon": "./icon.svg",
   "meta": {
     "title": "房间 · 跨会话协作",
-    "description": "把活派给另一个会话（房间），干完回报给派活方。带侧栏面板：分组、加入状态、回报记录。"
+    "description": "把活派给另一个会话（房间），干完回报给派活方。带侧栏面板：拖卡片分组，同组才能派活。"
   },
   "dsh": {
     "bundle": {
@@ -51,10 +51,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bufan528/dsh-rooms.git"
+    "url": "git+https://github.com/GF6364/dsh-rooms.git"
   },
-  "homepage": "https://github.com/bufan528/dsh-rooms#readme",
+  "homepage": "https://github.com/GF6364/dsh-rooms#readme",
   "bugs": {
-    "url": "https://github.com/bufan528/dsh-rooms/issues"
+    "url": "https://github.com/GF6364/dsh-rooms/issues"
   }
 }
