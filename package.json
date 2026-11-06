@@ -1,0 +1,60 @@
+{
+  "name": "dsh-rooms",
+  "version": "0.4.0",
+  "description": "Cross-session collaboration for DeepSeek Harness: assign work to another session (a room), get a report back, and watch it all in a sidebar panel.",
+  "private": false,
+  "type": "module",
+  "license": "MIT",
+  "author": "bufan528",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "icon": "./icon.svg",
+  "meta": {
+    "title": "房间 · 跨会话协作",
+    "description": "把活派给另一个会话（房间），干完回报给派活方。带侧栏面板：分组、加入状态、回报记录。"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    },
+    "manifestVersion": 1
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "multi-agent",
+    "sessions",
+    "orchestration"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bufan528/dsh-rooms.git"
+  },
+  "homepage": "https://github.com/bufan528/dsh-rooms#readme",
+  "bugs": {
+    "url": "https://github.com/bufan528/dsh-rooms/issues"
+  }
+}

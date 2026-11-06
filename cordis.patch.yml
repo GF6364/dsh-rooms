@@ -1,0 +1,50 @@
+# dsh-rooms 的 bundle patch：只插一行 Host 行。
+# 浏览器端那一半由 package.json 的 dsh.client 声明，loader 会自动打包并在页面里懒加载。
+#
+# 下面这些配置都可以在你自己的 cordis.patch.yml 里覆盖，不用改这个文件。
+- insert:
+    - id: rooms-open
+      name: dsh-rooms
+      config:
+        # 房间列表：这些只是「预置房间」，给它们绑会话、定目录和岗位说明。
+        # 工作区里的每个会话本来都是房间，不用在这里登记；title 只是还没标题时的占位名。
+        rooms:
+          - id: pianchang
+            title: 片场
+            description: 拍片、剪片、配音。
+            cwd: 'D:\dafeiyu'
+            sessionId: 'session-7ebca062-da72-454e-9bd7-8d51b893e082'
+          - id: faxingbu
+            title: 发行部
+            description: 发作品、发博客、发视频。
+            cwd: 'D:\dafeiyu'
+            sessionId: 'session-89c1913d-9fc0-47ca-b0db-3d34414aa7c0'
+          - id: liangongfang
+            title: 练功房
+            description: 练功、试新东西。
+            cwd: 'D:\dafeiyu'
+            sessionId: 'session-e0daee56-c0d8-4c09-89d3-baa4975e01fb'
+          - id: bokongshi
+            title: 播控室
+            description: 直播、盯弹幕。
+            cwd: 'D:\dafeiyu'
+            sessionId: 'session-02862cd5-7411-438e-a1e8-af459aa2edda'
+          # 想让哪个会话能派活，就给它配一间房（这里是我自己这个会话）
+          - id: main
+            title: 主控台
+            description: 我自己的会话，配成房间才能在面板这一侧派活。
+            cwd: 'D:\dafeiyu'
+            sessionId: 'session-ab675646-35ff-43ec-9cb1-f7fefb91c033'
+          # 我自己的测试间：试新功能、复现问题都往这儿派，坏了不心疼
+          - id: ceshibu
+            title: 测试部
+            description: 试各种问题、复现 bug、验证改动。
+            cwd: 'D:\dafeiyu'
+        # 房间默认工作目录；不填就用进程当前目录。
+        # defaultCwd: 'D:\work'
+        # 多久没动静就提醒（分钟），0 = 不提醒；也能在面板「配置」页改。
+        # idleTimeoutMinutes: 15
+        # 状态文件目录，默认 ~/.dsh-rooms
+        # stateDir: 'D:\work\.rooms'
+        # 面板接口前缀，默认 /dsh-rooms/api
+        # apiPrefix: '/dsh-rooms/api'
