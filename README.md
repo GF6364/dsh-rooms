@@ -1,4 +1,4 @@
-# dsh-rooms · 跨会话协作
+﻿# dsh-rooms · 跨会话协作
 
 把活派给另一个会话（**房间**），干完回报，在侧栏面板里看分组。
 
@@ -86,8 +86,12 @@ dsh plugin install /path/to/dsh-rooms
 | `room_send` | 派活给同组房间，立刻返回 |
 | `room_here` | 查自己这间房的 id，顺便归组 |
 | `room_report` | 房间回报 done / blocked / progress |
-| `room_cancel` | 叫停这一轮，不删会话 |
+| `room_cancel` | 叫停这一轮，不删会话；加 `清排队` 连排队一起摘 |
 | `room_reset` | 重开会话（上下文爆了、跑歪了时用） |
+| `room_inbox` | 列未取回报（带 id），可选 `清排队`、`全部`、`全部标已读` |
+| `room_take` | 按 id 取一条回报正文，取完标记已取并清掉排队里的重复 |
+| `room_wait` | 等新消息：阻塞到有新回报或新排队消息（超时秒可调），等待不烧 token |
+| `room_wake` | 外部主动唤醒：设置叫醒目标会话，或立刻试叫一次；脚本往 wake 目录写 json 即可 |
 
 不允许的组合会直接拒掉并说明原因：跨组、没分组、归档。
 
@@ -114,3 +118,4 @@ dsh plugin install /path/to/dsh-rooms
 ## 许可
 
 MIT
+

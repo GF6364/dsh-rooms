@@ -1,6 +1,6 @@
-{
+﻿{
   "name": "dsh-rooms",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Cross-session collaboration for DeepSeek Harness: assign work to another session (a room), get a report back, and watch it all in a sidebar panel.",
   "private": false,
   "type": "module",
@@ -58,3 +58,4 @@
     "url": "https://github.com/GF6364/dsh-rooms/issues"
   }
 }
+

@@ -54,6 +54,9 @@ function normalizeConfig(raw) {
     defaultCwd: (config.defaultCwd ?? '').toString(),
     stateDir: (config.stateDir ?? '').toString(),
     apiPrefix: (config.apiPrefix ?? DEFAULT_API_PREFIX).toString(),
+    // 外部主动唤醒（2026-11-17 主人要求）：脚本往这个目录写 *.json，插件就把里面的文字塞进指定会话
+    wakeDir: (config.wakeDir ?? '').toString(),
+    wakeToSessionId: (config.wakeToSessionId ?? '').toString(),
     reportHint: (config.reportHint
       ?? '干完用 room_report 工具回报：status 填 done 或 blocked，写清产出路径和自检结果。').toString(),
     // 派出去多少分钟没回报、会话也没在写盘，就提醒派活方；0 = 不提醒
@@ -101,6 +104,17 @@ function validate(tool, raw, spec) {
       if (!Array.isArray(value)) throw new Error(`${where}: 「${key}」必须是数组`);
       value = value.filter((item) => typeof item === 'string' && item.trim() !== '').map((item) => item.trim());
       if (rule.max !== undefined && value.length > rule.max) throw new Error(`${where}: 「${key}」最多 ${rule.max} 项`);
+    } else if (rule.type === 'boolean') {
+      if (typeof value === 'boolean') {
+        /* 直接用 */
+      } else if (typeof value === 'string') {
+        const text = value.trim().toLowerCase();
+        if (['true', '1', '是', 'yes', 'y'].includes(text)) value = true;
+        else if (['false', '0', '否', 'no', 'n'].includes(text)) value = false;
+        else throw new Error(`${where}: 「${key}」只能是 true 或 false`);
+      } else {
+        throw new Error(`${where}: 「${key}」必须是布尔值`);
+      }
     }
     out[key] = value;
   }
@@ -131,6 +145,80 @@ export function apply(ctx, rawConfig) {
 
   const rooms = new Map(config.rooms.map((room) => [room.id, room]));
   syncExtraRooms();
+
+  // ── 外部主动唤醒（2026-11-17 主人要求）────────────────────────────────
+  // 平时流水线全是脚本、不花 token；只有筛出「需要回复」时，脚本往 wake 目录写一个 json，
+  // 这里把里面的文字原样塞进指定会话，会话就醒了。这段文字是脚本拼的，不经过模型。
+  const wakeDir = config.wakeDir || path.join(stateDir, 'wake');
+
+  async function wakeSession(sessionId, text) {
+    if (!sessionId) throw new Error('没有配置 wakeToSessionId，不知道叫醒哪个会话');
+    let agent = ctx.agents.get(sessionId);
+    if (!agent) {
+      const handle = await ctx.agents.resume({ resumeSessionId: sessionId });
+      agent = handle.agent;
+    }
+    agent.followup({
+      id: randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text }],
+      source: { kind: 'user' },
+      time: Date.now(),
+    });
+  }
+
+  /** 叫醒目标：优先用面板/工具里设的值，其次用配置 */
+  const wakeTarget = () => state.settings?.wakeToSessionId || config.wakeToSessionId;
+
+  function scanWakeDir() {
+    let files = [];
+    try {
+      files = fs.readdirSync(wakeDir).filter((name) => name.endsWith('.json'));
+    } catch {
+      return; // 目录还没建好，下轮再说
+    }
+    for (const name of files) {
+      const full = path.join(wakeDir, name);
+      let text;
+      try {
+        const raw = fs.readFileSync(full, 'utf8');
+        // PowerShell 写 UTF8 常带 BOM，直接 JSON.parse 会失败；先剥掉再解析
+        const 干净 = raw.replace(/^\uFEFF/, '').trim();
+        try {
+          const parsed = JSON.parse(干净);
+          text = String(parsed?.text ?? parsed?.summary ?? 干净);
+        } catch {
+          text = 干净;
+        }
+      } catch (error) {
+        warn(`读唤醒文件失败（${name}）：${error?.message ?? error}`);
+        continue;
+      }
+      const 内容 = String(text ?? '').trim();
+      if (!内容) {
+        try { fs.renameSync(full, `${full}.empty`); } catch { /* 忽略 */ }
+        continue;
+      }
+      wakeSession(wakeTarget(), 内容)
+        .then(() => {
+          try { fs.renameSync(full, `${full}.sent`); } catch { /* 忽略 */ }
+          log(`外部唤醒：${name} 已塞进会话 ${wakeTarget()}`);
+        })
+        .catch((error) => {
+          warn(`外部唤醒失败（${name}）：${error?.message ?? error}`);
+        });
+    }
+  }
+
+  ctx.effect(() => {
+    try {
+      fs.mkdirSync(wakeDir, { recursive: true });
+    } catch (error) {
+      warn(`建唤醒目录失败：${error?.message ?? error}`);
+    }
+    const timer = setInterval(scanWakeDir, 3000);
+    return () => clearInterval(timer);
+  });
   /** 把自动登记的房间补进房间表；配置里同 id 的优先 */
   function syncExtraRooms() {
     for (const room of state.extraRooms) {
@@ -283,9 +371,54 @@ export function apply(ctx, rawConfig) {
 
   function rememberReport(roomId, report) {
     const list = state.reports[roomId] ?? [];
-    list.push({ ...report, ts: Date.now(), read: false });
+    // 每条回报都带 id（2026-11-17 主人要求）：事后能按 id 取回，也防止两边内容对不上
+    list.push({ ...report, id: report.id ?? randomUUID(), ts: Date.now(), read: false });
     state.reports[roomId] = list.slice(-REPORT_KEEP);
     persist();
+  }
+
+  /**
+   * 把某个会话排队里还没送进来的「房间回报」清掉（2026-11-17）：
+   * 主人忙的时候回报堆在排队里，光看面板没用——这里按 id 摘下来，顺便把正文交回。
+   */
+  async function 清会话排队({ 会话, 只匹配id = '' } = {}) {
+    const ctrl = ctx.get?.('sessionController');
+    if (!ctrl?.state || !会话) return { 可用: false, 清掉: [], 说明: '拿不到会话排队（缺 sessionController 或会话 id）' };
+    let 状态;
+    try {
+      状态 = await ctrl.state({ sessionId: 会话 }, new AbortController().signal);
+    } catch (error) {
+      return { 可用: false, 清掉: [], 说明: `读会话排队失败：${error?.message ?? error}` };
+    }
+    const 队列 = Array.isArray(状态?.queue) ? 状态.queue : [];
+    const 命中 = [];
+    for (const 项 of 队列) {
+      const 文 = JSON.stringify(项?.content ?? '');
+      if (!文.includes('房间回报')) continue;
+      const m = 文.match(/\[id:([0-9a-fA-F-]{8,})\]/);
+      const id = m?.[1] ?? '';
+      if (只匹配id && id !== 只匹配id) continue;
+      命中.push({ itemId: 项.id, reportId: id, 文 });
+    }
+    const 清掉 = [];
+    for (const h of 命中) {
+      try {
+        await ctrl.updateQueue({ sessionId: 会话, itemId: h.itemId, action: { kind: 'remove' } });
+        清掉.push(h);
+      } catch (error) {
+        warn(`清会话排队失败: ${error?.message ?? error}`);
+      }
+    }
+    return { 可用: true, 清掉, 说明: `从会话排队里摘掉 ${清掉.length} 条` };
+  }
+
+  /** 按 id 在所有房间里找一条回报 */
+  function 找回报(id) {
+    for (const [roomId, list] of Object.entries(state.reports ?? {})) {
+      const 命中 = (list ?? []).find((r) => r.id === id);
+      if (命中) return { roomId, report: 命中 };
+    }
+    return undefined;
   }
 
   // ── 会话：建、恢复、挂预设 ────────────────────────────────────────────
@@ -382,12 +515,35 @@ export function apply(ctx, rawConfig) {
     return senderRoom;
   }
 
-  async function sendToRoom(room, task, senderId) {
+  async function sendToRoom(room, task, senderId, options = {}) {
     assertCanSend(room, senderId);
     state.senders[room.id] = senderId;
     persist();
     const agent = await ensureRoomAgent(room);
     const body = config.reportHint ? `${task}\n\n${config.reportHint}` : task;
+    const 会话 = roomSessionId(room.id);
+
+    // 插队：把它作为 steering 消息塞进正在跑的那一轮，不排在队尾
+    if (options.插队) {
+      const ctrl = ctx.get?.('sessionController');
+      if (ctrl?.prompt && 会话) {
+        try {
+          await ctrl.prompt({
+            sessionId: 会话,
+            requestId: randomUUID(),
+            mode: 'steer',
+            content: [{ type: 'text', text: body }],
+            clientTimeZone: 'Asia/Shanghai',
+          }, new AbortController().signal);
+          pending.set(room.id, Date.now());
+          log(`插队给 ${room.id}（${body.length} 字，steering）`);
+          return { 插队: true };
+        } catch (error) {
+          warn(`插队失败，退回排队: ${error?.message ?? error}`);
+        }
+      }
+    }
+
     agent.followup({
       id: randomUUID(), role: 'user',
       content: [{ type: 'text', text: body }],
@@ -395,6 +551,7 @@ export function apply(ctx, rawConfig) {
     });
     pending.set(room.id, Date.now());
     log(`派活给 ${room.id}（${body.length} 字）`);
+    return { 插队: false };
   }
 
   /** 回报只回给派活方；派活方已经没了就只留在面板，不兜底、不硬塞 */
@@ -427,17 +584,52 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  async function cancelRoom(room) {
-    const agent = ctx.agents.get(roomSessionId(room.id));
-    pending.delete(room.id);
-    if (!agent) return false;
-    try {
-      await agent.cancel({ kind: 'user' });
-      return true;
-    } catch (error) {
-      warn(`叫停失败: ${error?.message ?? error}`);
-      return false;
+  async function cancelRoom(room, options = {}) {
+    const 会话 = roomSessionId(room.id);
+    const agent = ctx.agents.get(会话);
+    let 排队清掉 = 0;
+    let 在跑 = false;
+
+    // 先看它到底在不在跑，别把「没在跑」也说成叫停成功
+    const ctrl = ctx.get?.('sessionController');
+    if (ctrl?.state && 会话) {
+      try {
+        const 状态 = await ctrl.state({ sessionId: 会话 }, new AbortController().signal);
+        在跑 = Boolean(状态?.running || 状态?.active);
+      } catch { 在跑 = Boolean(agent); }
+    } else {
+      在跑 = Boolean(agent);
     }
+
+    // 真中断：优先走 sessionController.cancel，它会掐掉正在跑的那一轮
+    if (ctrl?.cancel && 会话) {
+      try {
+        ctrl.cancel({ sessionId: 会话 });
+      } catch (error) {
+        warn(`sessionController 取消失败: ${error?.message ?? error}`);
+      }
+    }
+    if (agent?.cancel) {
+      try { await agent.cancel({ kind: 'user' }); } catch { /* 已经不在跑就算了 */ }
+    }
+
+    // 清排队：把还没投递的消息摘掉，否则“停”本身也会排到队尾
+    if (options.清排队 && ctrl?.state && 会话) {
+      try {
+        const 状态 = await ctrl.state({ sessionId: 会话 }, new AbortController().signal);
+        for (const 项 of 状态?.queue ?? []) {
+          try {
+            await ctrl.updateQueue({ sessionId: 会话, itemId: 项.id, action: { kind: 'remove' } });
+            排队清掉 += 1;
+          } catch { /* 单条删不掉不影响其它 */ }
+        }
+      } catch (error) {
+        warn(`读排队失败: ${error?.message ?? error}`);
+      }
+    }
+
+    pending.delete(room.id);
+    return { 停了: 在跑, 排队清掉 };
   }
 
   async function resetRoom(room) {
@@ -467,6 +659,8 @@ export function apply(ctx, rawConfig) {
     return false;
   }
 
+  // 2026-11-18 主人定：超时提醒要每 15 分钟重复一次，只报一次会把「干得慢」和「真卡死」混在一起
+  const 超时次数 = new Map();
   ctx.effect(() => {
     const timer = setInterval(() => {
       const now = Date.now();
@@ -475,17 +669,21 @@ export function apply(ctx, rawConfig) {
         const minutes = room ? effective(room).idleTimeoutMinutes : idleMinutes();
         if (!minutes) continue;
         if (now - startedAt <= minutes * 60_000) continue;
+        // 还在写盘就顺延，说明只是慢
         if (sessionTouchedRecently(roomSessionId(roomId))) {
           pending.set(roomId, now);
           continue;
         }
-        pending.delete(roomId);
+        // 没动静：继续留着 pending，每轮都会再提醒一次，直到它回报
+        const 第几次 = (超时次数.get(roomId) ?? 0) + 1;
+        超时次数.set(roomId, 第几次);
+        pending.set(roomId, now);
         const text =
-          `[房间回报 · ${room ? roomLabel(room) : roomId}]\n状态: 超时\n` +
-          `${minutes} 分钟没回音，会话也没在写盘，大概率卡住或崩了。`;
+          `[房间回报 · ${room ? roomLabel(room) : roomId}]\n状态: 超时（第 ${第几次} 次）\n` +
+          `${minutes} 分钟没回音，会话也没在写盘。还活着就回一句进度；真卡住就说卡在哪。`;
         rememberReport(roomId, { status: 'timeout', summary: text });
         void deliverReport(roomId, text);
-        log(`房间 ${roomId} 超过 ${minutes} 分钟没动静，已提醒`);
+        log(`房间 ${roomId} 第 ${第几次} 次超时提醒（${minutes} 分钟没动静）`);
       }
     }, 5000);
     return () => clearInterval(timer);
@@ -659,6 +857,259 @@ export function apply(ctx, rawConfig) {
   };
 
   ctx.tools.register({
+    name: 'room_wake',
+    description:
+      '外部主动唤醒：设置「叫醒哪个会话」，或立刻试叫一次。平时流水线全是脚本不花 token，只有筛出需要回复时，脚本往 wake 目录写 json，插件按这里设的目标把文字塞进会话。',
+    parameters: {
+      type: 'object',
+      properties: {
+        目标会话: { type: 'string', description: '要叫醒的会话 id（形如 session-xxxx），设了就记住' },
+        立即叫醒: { type: 'string', description: '给一段文字，立刻塞进目标会话（测试用）' },
+        看现状: { type: 'boolean', description: 'true 时只显示当前目标与唤醒目录' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { detail: { type: 'string' } }, required: ['detail'], additionalProperties: false },
+      render: (_a, v) => [{ type: 'text', text: v.detail }],
+    },
+    async execute(rawArgs) {
+      const a = validate('room_wake', rawArgs ?? {}, {
+        目标会话: { type: 'string', max: 80 },
+        立即叫醒: { type: 'string', max: 20000 },
+        看现状: { type: 'boolean' },
+      });
+      const 行 = [];
+      if (a.目标会话) {
+        state.settings.wakeToSessionId = a.目标会话.trim();
+        persist();
+        行.push(`已把叫醒目标设成 ${state.settings.wakeToSessionId}`);
+      }
+      if (a.立即叫醒) {
+        await wakeSession(wakeTarget(), a.立即叫醒);
+        行.push(`已叫醒 ${wakeTarget()}（试叫 ${String(a.立即叫醒).length} 字）`);
+      }
+      行.push(`当前叫醒目标：${wakeTarget() || '（没设）'}`);
+      行.push(`唤醒目录：${wakeDir}（脚本往里写 *.json 即可）`);
+      return { detail: 行.join('\n') };
+    },
+  });
+
+  ctx.tools.register({
+    name: 'room_inbox',
+    description:
+      '看有哪些房间回报还没取走。每条有 id；只列标题不吐正文，省 token。带 清排队=true 会把总控会话排队里堆着的回报摘掉，不再重复投递。',
+    parameters: {
+      type: 'object',
+      properties: {
+        清排队: { type: 'boolean', description: 'true 时顺便清掉会话排队里的回报并返回其 id' },
+        全部: { type: 'boolean', description: 'true 时连已取过的也列出来（排查用）' },
+        全部标已读: { type: 'boolean', description: 'true 时把所有历史回报标成已取（只标记，不删除记录）' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { detail: { type: 'string' } }, required: ['detail'], additionalProperties: false },
+      render: (_a, v) => [{ type: 'text', text: v.detail }],
+    },
+    async execute(rawArgs, exec) {
+      const a = validate('room_inbox', rawArgs ?? {}, {
+        清排队: { type: 'boolean' },
+        全部: { type: 'boolean' },
+        全部标已读: { type: 'boolean' },
+      });
+
+      // 把历史回报一次性标成已取（只标记，不删记录）
+      let 标记说明 = '';
+      if (a.全部标已读) {
+        let 条数 = 0;
+        for (const list of Object.values(state.reports ?? {})) {
+          for (const r of list ?? []) {
+            if (!r.read) { r.read = true; 条数++; }
+          }
+        }
+        if (state.unread && typeof state.unread === 'object') {
+          for (const key of Object.keys(state.unread)) delete state.unread[key];
+        }
+        if (条数 > 0) persist();
+        标记说明 = `已把 ${条数} 条历史回报标成已取（记录还在，面板能看到）`;
+      }
+      const 全部列表 = [];
+      let 补过id = false;
+      for (const [roomId, list] of Object.entries(state.reports ?? {})) {
+        for (const r of list ?? []) {
+          // 老记录没有 id（改版前存的），这里补一个并落盘，之后就能稳定按 id 取
+          if (!r.id) { r.id = randomUUID(); 补过id = true; }
+          全部列表.push({ roomId, ...r });
+        }
+      }
+      if (补过id) persist();
+      全部列表.sort((x, y) => (x.ts ?? 0) - (y.ts ?? 0));
+      const 待取 = a.全部 ? 全部列表 : 全部列表.filter((r) => !r.read);
+
+      const titles = await readTitles();
+      const 行 = 待取.map((r) => {
+        const 房间 = rooms.get(r.roomId);
+        const 名 = 房间 ? nameOf(房间, titles) : r.roomId;
+        const 时间 = new Date(r.ts ?? Date.now()).toLocaleString('zh-CN', { hour12: false });
+        const 首行 = String(r.summary ?? '').split('\n').slice(0, 2).join(' / ').slice(0, 80);
+        return `${r.id}｜${名}｜${r.status}｜${r.read ? '已取' : '未取'}｜${时间}｜${首行}`;
+      });
+
+      let 排队说明 = '';
+      if (a.清排队) {
+        const 会话 = exec?.agent?.id ?? exec?.agent?.session?.header?.id;
+        const r = await 清会话排队({ 会话 });
+        排队说明 = r.说明;
+        // 摘下来的那些如果能在台账里对上，一并标成已取，免得下次又列出来
+        for (const h of r.清掉) {
+          if (!h.reportId) continue;
+          const 找 = 找回报(h.reportId);
+          if (找) 找.report.read = true;
+        }
+        if (r.清掉.length) persist();
+      }
+
+      return {
+        detail: [
+          行.length ? `未取回报 ${行.length} 条（id｜房间｜状态｜取没取｜时间｜开头）:` : '没有待取的回报。',
+          ...行,
+          标记说明,
+          排队说明,
+        ].filter(Boolean).join('\n'),
+      };
+    },
+  });
+
+  ctx.tools.register({
+    name: 'room_take',
+    description:
+      '按 id 取走一条房间回报的完整正文。取走后标成已取，并把总控会话排队里对应的那条删掉，避免同一份内容重复进上下文。id 传「最新」就取最早一条未取的。',
+    parameters: {
+      type: 'object',
+      properties: { id: { type: 'string', description: '回报 id，见 room_inbox；也可以传 最新' } },
+      required: ['id'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { detail: { type: 'string' } }, required: ['detail'], additionalProperties: false },
+      render: (_a, v) => [{ type: 'text', text: v.detail }],
+    },
+    async execute(rawArgs, exec) {
+      const a = validate('room_take', rawArgs ?? {}, {
+        id: { type: 'string', required: true, max: 64 },
+      });
+      let 目标;
+      if (a.id === '最新') {
+        const 全部 = [];
+        for (const [roomId, list] of Object.entries(state.reports ?? {})) {
+          for (const r of list ?? []) if (!r.read) 全部.push({ roomId, report: r, id: r.id });
+        }
+        全部.sort((x, y) => (x.report.ts ?? 0) - (y.report.ts ?? 0));
+        目标 = 全部[0];
+      } else {
+        const 找 = 找回报(a.id);
+        if (找) 目标 = { ...找, id: a.id };
+      }
+      if (!目标) return { detail: `找不到这条回报: ${a.id}` };
+
+      目标.report.read = true;
+      persist();
+      const 会话 = exec?.agent?.id ?? exec?.agent?.session?.header?.id;
+      const 清 = await 清会话排队({ 会话, 只匹配id: 目标.id });
+      const 房间 = rooms.get(目标.roomId);
+      const titles = await readTitles();
+      const 名 = 房间 ? nameOf(房间, titles) : 目标.roomId;
+      return {
+        detail: [
+          `[回报 ${目标.id} · ${名} · ${目标.report.status}]`,
+          String(目标.report.summary ?? ''),
+          清.清掉.length ? `（已从会话排队里移除 ${清.清掉.length} 条重复投递）` : '',
+        ].filter(Boolean).join('\n'),
+      };
+    },
+  });
+
+  ctx.tools.register({
+    name: 'room_wait',
+    description:
+      '等新回报：阻塞到有新的未取回报（或超时）再返回，等待期间不消耗模型 token。带上 超时秒 控制最长等多久（默认 900 秒，最大 3600）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        超时秒: { type: 'string', description: '最长等多久，秒；默认 900，最大 3600' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { detail: { type: 'string' } }, required: ['detail'], additionalProperties: false },
+      render: (_a, v) => [{ type: 'text', text: v.detail }],
+    },
+    async execute(rawArgs) {
+      const a = validate('room_wait', rawArgs ?? {}, {
+        超时秒: { type: 'string', max: 8 },
+      });
+      const 上限 = Math.max(10, Math.min(3600, Number(a.超时秒) || 900));
+      const 起 = Date.now();
+
+      const 快照 = () => {
+        const 全部 = [];
+        for (const [roomId, list] of Object.entries(state.reports ?? {})) {
+          for (const r of list ?? []) if (!r.read) 全部.push({ roomId, id: r.id, status: r.status, ts: r.ts ?? 0 });
+        }
+        return 全部;
+      };
+
+      const 起始 = new Set(快照().map((x) => x.id));
+      const ctrl = ctx.get?.('sessionController');
+      const 目标会话 = wakeTarget();
+      let 已见排队 = new Set();
+      while (Date.now() - 起 < 上限 * 1000) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const 现在 = 快照().filter((x) => !起始.has(x.id));
+        if (现在.length > 0) {
+          return {
+            detail: `等到了 ${现在.length} 条新回报：\n` + 现在.map((x) => `${x.id}｜${x.roomId}｜${x.status}`).join('\n'),
+          };
+        }
+        // 同时看总控会话的排队：回报被投递进 prompt 队列时，这里把它摘下来并交出正文
+        if (ctrl?.state && 目标会话) {
+          try {
+            const 状态 = await ctrl.state({ sessionId: 目标会话 }, new AbortController().signal);
+            const 队列 = Array.isArray(状态?.queue) ? 状态.queue : [];
+            for (const 项 of 队列) {
+              const 文 = JSON.stringify(项?.content ?? '');
+              if (已见排队.has(项.id)) continue;
+              已见排队.add(项.id);
+              const 是回报 = 文.includes('房间回报');
+              // 回报直接摘掉；别的消息（比如 QQ 来的）不摘，只把正文交出来
+              if (是回报) {
+                try {
+                  await ctrl.updateQueue({ sessionId: 目标会话, itemId: 项.id, action: { kind: 'remove' } });
+                } catch { /* 删不掉也继续，正文照样给 */ }
+              }
+              const 正文 = String(项?.content?.[0]?.text ?? 文);
+              // 台账里能对上的标成已取，避免下次又列出来
+              const 首行 = 正文.split('\n').slice(0, 3).join('\n');
+              for (const list of Object.values(state.reports ?? {})) {
+                for (const r of list ?? []) {
+                  if (!r.read && 正文.includes(String(r.summary ?? '').slice(0, 30))) r.read = true;
+                }
+              }
+              persist();
+              return { detail: '从会话排队里摘到一条回报：\n' + 首行 };
+            }
+          } catch { /* 读不到排队就算了，下一轮再看 */ }
+        }
+      }
+      const 存 = 快照();
+      return {
+        detail: `等了 ${上限} 秒没有新回报（未取共 ${存.length} 条）` + (存.length ? '\n' + 存.map((x) => `${x.id}｜${x.roomId}｜${x.status}`).join('\n') : ''),
+      };
+    },
+  });
+
+  ctx.tools.register({
     name: 'room_list',
     description: '看有哪些房间、各自的会话 id、目录、分组和最近一次回报。工作区里每个会话都是一间房。',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
@@ -699,6 +1150,7 @@ export function apply(ctx, rawConfig) {
       properties: {
         room: { type: 'string', description: '房间 id，见 room_list' },
         task: { type: 'string', description: '要它干的事，写清楚交付要求' },
+        插队: { type: 'boolean', description: 'true 时作为插队消息塞进它正在跑的那一轮，不排队；只补充内容、不想打断时用它' },
       },
       required: ['room', 'task'],
       additionalProperties: false,
@@ -711,12 +1163,16 @@ export function apply(ctx, rawConfig) {
       const args = validate('room_send', rawArgs, {
         room: { type: 'string', required: true, max: 64 },
         task: { type: 'string', required: true, min: 8, max: 20000 },
+        插队: { type: 'boolean' },
       });
       const room = rooms.get(args.room);
       if (!room) throw new Error(`没有这个房间: ${args.room}（可用: ${[...rooms.keys()].join(', ') || '无'}）`);
       const senderId = exec?.agent?.id ?? exec?.agent?.session?.header?.id;
-      await sendToRoom(room, args.task, senderId);
-      return { ok: true, detail: `已派给「${roomLabel(room)}」（${groupName(groupOf(room.id))}）` };
+      const 结果 = await sendToRoom(room, args.task, senderId, { 插队: args.插队 === true });
+      return {
+        ok: true,
+        detail: `已${结果.插队 ? '插队' : '派'}给「${roomLabel(room)}」（${groupName(groupOf(room.id))}）`,
+      };
     },
   });
 
@@ -759,6 +1215,7 @@ export function apply(ctx, rawConfig) {
         args.question ? `需要主人定: ${args.question}` : '',
       ].filter(Boolean).join('\n');
       pending.delete(room.id);
+      超时次数.delete(room.id);
       rememberReport(room.id, {
         status: args.status,
         summary: args.summary,
@@ -774,18 +1231,33 @@ export function apply(ctx, rawConfig) {
 
   ctx.tools.register({
     name: 'room_cancel',
-    description: '叫停某个房间正在跑的这一轮。不删会话，只是停下来，方便打回或重派。',
-    parameters: roomParams,
+    description: '叫停某个房间正在跑的这一轮。不删会话。默认只掐当前这一轮；加 清排队=true 时把它排队里还没投递的消息一起摘掉（“停”才不会排到队尾）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        room: { type: 'string', description: '房间 id，见 room_list' },
+        清排队: { type: 'boolean', description: 'true 时清空它排队里的消息，默认只中断当前轮' },
+      },
+      required: ['room'],
+      additionalProperties: false,
+    },
     output: {
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, detail: { type: 'string' } }, required: ['ok'], additionalProperties: false },
       render: (_a, v) => [{ type: 'text', text: v.detail ?? '已叫停' }],
     },
     async execute(rawArgs) {
-      const args = validate('room_cancel', rawArgs, roomSpec);
+      const args = validate('room_cancel', rawArgs ?? {}, {
+        room: { type: 'string', required: true, max: 64 },
+        清排队: { type: 'boolean' },
+      });
       const room = rooms.get(args.room);
       if (!room) throw new Error(`没有这个房间: ${args.room}`);
-      const ok = await cancelRoom(room);
-      return { ok, detail: ok ? `已叫停「${roomLabel(room)}」` : `「${roomLabel(room)}」没在跑` };
+      const 结果 = await cancelRoom(room, { 清排队: args.清排队 === true });
+      const 尾 = 结果.排队清掉 > 0 ? `，顺手清掉 ${结果.排队清掉} 条排队` : '';
+      return {
+        ok: 结果.停了,
+        detail: 结果.停了 ? `已叫停「${roomLabel(room)}」${尾}` : `「${roomLabel(room)}」没在跑${尾}`,
+      };
     },
   });
 
@@ -842,3 +1314,9 @@ export function apply(ctx, rawConfig) {
 
   log(`房间工具已注册（${rooms.size} 个房间，状态目录 ${stateDir}）`);
 }
+
+
+
+
+
+
